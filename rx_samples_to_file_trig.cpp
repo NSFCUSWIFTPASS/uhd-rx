@@ -148,8 +148,14 @@ void recv_to_file_triggered(
     size_t pre_trig_write_idx = 0;
     bool pre_trig_full = false;
 
-    // RAM buffer for recording (allocated after trigger to save memory until needed)
+    // Pre-allocate RAM buffer for recording (pre-trigger + recording duration)
+    size_t total_samples = pre_trig_samples + recording_samples;
     std::vector<samp_type> ram_buffer;
+
+    std::cout << "Pre-allocating RAM buffer for " << total_samples << " samples ("
+              << (total_samples * sizeof(samp_type) / 1e6) << " MB)..." << std::endl;
+    ram_buffer.resize(total_samples);
+    std::cout << "RAM buffer allocated." << std::endl;
 
     // Start detection thread
     std::thread detector(detection_thread_fn<samp_type>,
@@ -221,12 +227,6 @@ void recv_to_file_triggered(
     }
 
     // === POST-TRIGGER PHASE ===
-    std::cout << "Allocating RAM buffer for " << recording_samples << " samples..." << std::endl;
-
-    // Allocate recording buffer (pre-trigger + recording duration)
-    size_t total_samples = pre_trig_samples + recording_samples;
-    ram_buffer.resize(total_samples);
-
     // Copy pre-trigger buffer to RAM (unwrap circular buffer)
     size_t pre_trig_copied = 0;
     if (pre_trig_full) {
