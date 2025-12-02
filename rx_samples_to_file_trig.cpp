@@ -1,0 +1,490 @@
+//
+// Copyright 2010-2011,2014 Ettus Research LLC
+// Copyright 2018 Ettus Research, a National Instruments Company
+//
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// Modified for triggered recording with signal detection
+
+#include <uhd/exception.hpp>
+#include <uhd/types/tune_request.hpp>
+#include <uhd/usrp/multi_usrp.hpp>
+#include <uhd/utils/safe_main.hpp>
+#include <uhd/utils/thread.hpp>
+#include <boost/format.hpp>
+#include <boost/lexical_cast.hpp>
+#include <boost/program_options.hpp>
+#include <chrono>
+#include <complex>
+#include <csignal>
+#include <fstream>
+#include <iostream>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <atomic>
+#include <cmath>
+
+namespace po = boost::program_options;
+
+// Global state
+static bool stop_signal_called = false;
+static std::atomic<bool> triggered{false};
+static std::atomic<int> detection_count{0};
+
+// Double buffer synchronization
+static std::mutex buf_mutex;
+static std::condition_variable buf_ready;
+static std::atomic<bool> detection_thread_running{true};
+
+void sig_int_handler(int)
+{
+    stop_signal_called = true;
+    detection_thread_running = false;
+    buf_ready.notify_all();
+}
+
+// Compute mean power in dB for complex samples (matches Python implementation)
+// Normalizes SC16 by 32768, computes |z|^2 / 50, returns 10*log10(mean)
+template <typename samp_type>
+double compute_mean_power_db(const samp_type* samples, size_t count)
+{
+    double sum = 0.0;
+    const double norm = 32768.0;
+    const double impedance = 50.0;
+
+    for (size_t i = 0; i < count; i++) {
+        double re = static_cast<double>(samples[i].real()) / norm;
+        double im = static_cast<double>(samples[i].imag()) / norm;
+        double mag_sq = re * re + im * im;  // |z|^2
+        sum += mag_sq / impedance;
+    }
+
+    double mean_power = sum / static_cast<double>(count);
+    return 10.0 * std::log10(mean_power + 1e-20);  // 10*log10 for power
+}
+
+// Detection thread function
+template <typename samp_type>
+void detection_thread_fn(
+    std::vector<samp_type>* process_buf,
+    size_t* process_count,
+    double threshold,
+    int hyst)
+{
+    while (detection_thread_running && !triggered) {
+        std::unique_lock<std::mutex> lock(buf_mutex);
+        buf_ready.wait(lock, [&]{
+            return !detection_thread_running || triggered || *process_count > 0;
+        });
+
+        if (!detection_thread_running || triggered) break;
+        if (*process_count == 0) continue;
+
+        // Compute mean power in dB
+        double avg_db = compute_mean_power_db(process_buf->data(), *process_count);
+        *process_count = 0;  // Mark as processed
+
+        // Threshold check with hysteresis
+        if (avg_db > threshold) {
+            int count = ++detection_count;
+            std::cout << "\ravg=" << avg_db << " dB [" << count << "/" << hyst << "] ABOVE    " << std::flush;
+            if (count >= hyst) {
+                triggered = true;
+                std::cout << "\nTRIGGERED!" << std::endl;
+            }
+        } else {
+            detection_count = 0;
+            std::cout << "\ravg=" << avg_db << " dB [0/" << hyst << "]         " << std::flush;
+        }
+    }
+}
+
+template <typename samp_type>
+void recv_to_file_triggered(
+    uhd::usrp::multi_usrp::sptr usrp,
+    const std::string& cpu_format,
+    const std::string& wire_format,
+    const size_t& channel,
+    const std::string& file,
+    size_t samps_per_buff,
+    double time_requested,
+    double threshold,
+    int hyst,
+    double detect_dur,
+    double pre_trig_time,
+    bool null,
+    bool continue_on_bad_packet)
+{
+    // Create receive streamer
+    uhd::stream_args_t stream_args(cpu_format, wire_format);
+    std::vector<size_t> channel_nums;
+    channel_nums.push_back(channel);
+    stream_args.channels = channel_nums;
+    uhd::rx_streamer::sptr rx_stream = usrp->get_rx_stream(stream_args);
+
+    uhd::rx_metadata_t md;
+    double sample_rate = usrp->get_rx_rate(channel);
+
+    // Calculate buffer sizes
+    size_t detect_samples = static_cast<size_t>(detect_dur * sample_rate);
+    size_t pre_trig_samples = static_cast<size_t>(pre_trig_time * sample_rate);
+    size_t recording_samples = static_cast<size_t>(time_requested * sample_rate);
+
+    std::cout << "Detection window: " << detect_samples << " samples (" << detect_dur << "s)" << std::endl;
+    std::cout << "Pre-trigger buffer: " << pre_trig_samples << " samples (" << pre_trig_time << "s)" << std::endl;
+    std::cout << "Recording duration: " << recording_samples << " samples (" << time_requested << "s)" << std::endl;
+
+    // Double buffers for detection
+    std::vector<samp_type> detect_buf_a(detect_samples);
+    std::vector<samp_type> detect_buf_b(detect_samples);
+    std::vector<samp_type>* active_buf = &detect_buf_a;
+    std::vector<samp_type>* process_buf = &detect_buf_b;
+    size_t active_buf_idx = 0;
+    size_t process_count = 0;
+
+    // Circular pre-trigger buffer
+    std::vector<samp_type> pre_trig_buffer(pre_trig_samples);
+    size_t pre_trig_write_idx = 0;
+    bool pre_trig_full = false;
+
+    // RAM buffer for recording (allocated after trigger to save memory until needed)
+    std::vector<samp_type> ram_buffer;
+
+    // Start detection thread
+    std::thread detector(detection_thread_fn<samp_type>,
+                        process_buf, &process_count, threshold, hyst);
+
+    // Start continuous streaming
+    uhd::stream_cmd_t stream_cmd(uhd::stream_cmd_t::STREAM_MODE_START_CONTINUOUS);
+    stream_cmd.stream_now = true;
+    rx_stream->issue_stream_cmd(stream_cmd);
+
+    std::cout << "\nWaiting for trigger (threshold=" << threshold << ", hyst=" << hyst << ")..." << std::endl;
+
+    bool overflow_message = true;
+
+    // === PRE-TRIGGER PHASE ===
+    while (!stop_signal_called && !triggered) {
+        size_t num_rx_samps = rx_stream->recv(
+            &(*active_buf)[active_buf_idx],
+            std::min(samps_per_buff, detect_samples - active_buf_idx),
+            md, 3.0, false);
+
+        if (md.error_code == uhd::rx_metadata_t::ERROR_CODE_TIMEOUT) {
+            std::cout << "Timeout while streaming" << std::endl;
+            break;
+        }
+        if (md.error_code == uhd::rx_metadata_t::ERROR_CODE_OVERFLOW) {
+            if (overflow_message) {
+                overflow_message = false;
+                std::cerr << "Overflow during detection phase" << std::endl;
+            }
+            continue;
+        }
+        if (md.error_code != uhd::rx_metadata_t::ERROR_CODE_NONE) {
+            if (continue_on_bad_packet) continue;
+            else throw std::runtime_error(md.strerror());
+        }
+
+        // Copy to circular pre-trigger buffer
+        for (size_t i = 0; i < num_rx_samps; i++) {
+            pre_trig_buffer[pre_trig_write_idx] = (*active_buf)[active_buf_idx + i];
+            pre_trig_write_idx = (pre_trig_write_idx + 1) % pre_trig_samples;
+            if (pre_trig_write_idx == 0) pre_trig_full = true;
+        }
+
+        active_buf_idx += num_rx_samps;
+
+        // Detection buffer full - swap and signal detection thread
+        if (active_buf_idx >= detect_samples) {
+            {
+                std::lock_guard<std::mutex> lock(buf_mutex);
+                std::swap(active_buf, process_buf);
+                process_count = detect_samples;
+            }
+            buf_ready.notify_one();
+            active_buf_idx = 0;
+        }
+    }
+
+    // Stop detection thread
+    detection_thread_running = false;
+    buf_ready.notify_all();
+    detector.join();
+
+    if (!triggered) {
+        std::cout << "\nStopped without trigger." << std::endl;
+        stream_cmd.stream_mode = uhd::stream_cmd_t::STREAM_MODE_STOP_CONTINUOUS;
+        rx_stream->issue_stream_cmd(stream_cmd);
+        return;
+    }
+
+    // === POST-TRIGGER PHASE ===
+    std::cout << "Allocating RAM buffer for " << recording_samples << " samples..." << std::endl;
+
+    // Allocate recording buffer (pre-trigger + recording duration)
+    size_t total_samples = pre_trig_samples + recording_samples;
+    ram_buffer.resize(total_samples);
+
+    // Copy pre-trigger buffer to RAM (unwrap circular buffer)
+    size_t pre_trig_copied = 0;
+    if (pre_trig_full) {
+        // Buffer wrapped - copy from write_idx to end, then start to write_idx
+        for (size_t i = pre_trig_write_idx; i < pre_trig_samples; i++) {
+            ram_buffer[pre_trig_copied++] = pre_trig_buffer[i];
+        }
+        for (size_t i = 0; i < pre_trig_write_idx; i++) {
+            ram_buffer[pre_trig_copied++] = pre_trig_buffer[i];
+        }
+    } else {
+        // Buffer not full - copy from start to write_idx
+        for (size_t i = 0; i < pre_trig_write_idx; i++) {
+            ram_buffer[pre_trig_copied++] = pre_trig_buffer[i];
+        }
+    }
+    std::cout << "Copied " << pre_trig_copied << " pre-trigger samples" << std::endl;
+
+    // Record for the requested duration
+    size_t num_total_samps = pre_trig_copied;
+    const auto start_time = std::chrono::steady_clock::now();
+    const auto stop_time = start_time + std::chrono::milliseconds(int64_t(1000 * time_requested));
+
+    std::cout << "Recording..." << std::endl;
+
+    while (!stop_signal_called &&
+           num_total_samps < total_samples &&
+           std::chrono::steady_clock::now() <= stop_time) {
+
+        size_t remaining = total_samples - num_total_samps;
+        size_t to_recv = std::min(samps_per_buff, remaining);
+
+        size_t num_rx_samps = rx_stream->recv(
+            &ram_buffer[num_total_samps],
+            to_recv,
+            md, 3.0, false);
+
+        if (md.error_code == uhd::rx_metadata_t::ERROR_CODE_TIMEOUT) break;
+        if (md.error_code == uhd::rx_metadata_t::ERROR_CODE_OVERFLOW) {
+            std::cerr << "Overflow during recording!" << std::endl;
+            continue;
+        }
+        if (md.error_code != uhd::rx_metadata_t::ERROR_CODE_NONE) {
+            if (continue_on_bad_packet) continue;
+            else throw std::runtime_error(md.strerror());
+        }
+
+        num_total_samps += num_rx_samps;
+    }
+
+    // Stop streaming
+    stream_cmd.stream_mode = uhd::stream_cmd_t::STREAM_MODE_STOP_CONTINUOUS;
+    rx_stream->issue_stream_cmd(stream_cmd);
+
+    std::cout << "\nRecording complete. Total samples: " << num_total_samps << std::endl;
+
+    // Write to file
+    if (!null && num_total_samps > 0) {
+        std::cout << "Writing to file..." << std::endl;
+        const auto write_start = std::chrono::steady_clock::now();
+
+        std::ofstream outfile(file.c_str(), std::ofstream::binary);
+        if (!outfile.is_open()) {
+            throw std::runtime_error("Failed to open output file");
+        }
+        outfile.write(reinterpret_cast<const char*>(ram_buffer.data()),
+                      num_total_samps * sizeof(samp_type));
+        outfile.close();
+
+        const auto write_stop = std::chrono::steady_clock::now();
+        double write_duration = std::chrono::duration<double>(write_stop - write_start).count();
+        std::cout << "File write completed in " << write_duration << " seconds" << std::endl;
+    }
+}
+
+typedef std::function<uhd::sensor_value_t(const std::string&)> get_sensor_fn_t;
+
+bool check_locked_sensor(std::vector<std::string> sensor_names,
+    const char* sensor_name,
+    get_sensor_fn_t get_sensor_fn,
+    double setup_time)
+{
+    if (std::find(sensor_names.begin(), sensor_names.end(), sensor_name)
+        == sensor_names.end())
+        return false;
+
+    auto setup_timeout = std::chrono::steady_clock::now()
+                         + std::chrono::milliseconds(int64_t(setup_time * 1000));
+    bool lock_detected = false;
+
+    std::cout << boost::format("Waiting for \"%s\": ") % sensor_name;
+    std::cout.flush();
+
+    while (true) {
+        if (lock_detected && (std::chrono::steady_clock::now() > setup_timeout)) {
+            std::cout << " locked." << std::endl;
+            break;
+        }
+        if (get_sensor_fn(sensor_name).to_bool()) {
+            std::cout << "+";
+            std::cout.flush();
+            lock_detected = true;
+        } else {
+            if (std::chrono::steady_clock::now() > setup_timeout) {
+                std::cout << std::endl;
+                throw std::runtime_error(
+                    str(boost::format("timed out waiting for lock on sensor \"%s\"")
+                        % sensor_name));
+            }
+            std::cout << "_";
+            std::cout.flush();
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    std::cout << std::endl;
+    return true;
+}
+
+int UHD_SAFE_MAIN(int argc, char* argv[])
+{
+    // Variables to be set by program options
+    std::string args, file, type, ant, subdev, ref, wirefmt;
+    size_t channel, spb;
+    double rate, freq, gain, bw, total_time, setup_time, lo_offset;
+    double threshold, detect_dur, pre_trig_time;
+    int hyst;
+
+    // Setup program options
+    po::options_description desc("Allowed options");
+    desc.add_options()
+        ("help", "help message")
+        ("args", po::value<std::string>(&args)->default_value(""), "multi uhd device address args")
+        ("file", po::value<std::string>(&file)->default_value("usrp_samples.dat"), "output file")
+        ("type", po::value<std::string>(&type)->default_value("short"), "sample type: double, float, or short")
+        ("duration", po::value<double>(&total_time)->default_value(5.0), "recording duration after trigger (seconds)")
+        ("spb", po::value<size_t>(&spb)->default_value(10000), "samples per buffer")
+        ("rate", po::value<double>(&rate)->default_value(1e6), "sample rate (Hz)")
+        ("freq", po::value<double>(&freq)->default_value(0.0), "RF center frequency (Hz)")
+        ("lo-offset", po::value<double>(&lo_offset)->default_value(0.0), "LO offset (Hz)")
+        ("gain", po::value<double>(&gain), "RF gain (dB)")
+        ("ant", po::value<std::string>(&ant), "antenna selection")
+        ("subdev", po::value<std::string>(&subdev), "subdevice specification")
+        ("channel", po::value<size_t>(&channel)->default_value(0), "channel to use")
+        ("bw", po::value<double>(&bw), "analog frontend filter bandwidth (Hz)")
+        ("ref", po::value<std::string>(&ref)->default_value("internal"), "reference source")
+        ("wirefmt", po::value<std::string>(&wirefmt)->default_value("sc16"), "wire format")
+        ("setup", po::value<double>(&setup_time)->default_value(1.0), "setup time (seconds)")
+        ("null", "run without writing to file")
+        ("continue", "don't abort on bad packet")
+        ("skip-lo", "skip LO lock check")
+        // Trigger options
+        ("trig", po::value<double>(&threshold), "trigger threshold (dB)")
+        ("hyst", po::value<int>(&hyst)->default_value(3), "hysteresis count for trigger")
+        ("detect-dur", po::value<double>(&detect_dur)->default_value(0.5), "detection window duration (seconds)")
+        ("pre-trig", po::value<double>(&pre_trig_time)->default_value(1.0), "pre-trigger buffer (seconds)")
+    ;
+
+    po::variables_map vm;
+    po::store(po::parse_command_line(argc, argv, desc), vm);
+    po::notify(vm);
+
+    if (vm.count("help")) {
+        std::cout << "UHD RX Samples to File with Trigger" << std::endl;
+        std::cout << desc << std::endl;
+        return ~0;
+    }
+
+    bool null = vm.count("null") > 0;
+    bool continue_on_bad_packet = vm.count("continue") > 0;
+
+    bool trig_enabled = vm.count("trig") > 0;
+    if (!trig_enabled) {
+        std::cerr << "Error: --trig threshold must be specified (in dB)" << std::endl;
+        return ~0;
+    }
+
+    // Create USRP device
+    std::cout << std::endl;
+    std::cout << boost::format("Creating the usrp device with: %s...") % args << std::endl;
+    uhd::usrp::multi_usrp::sptr usrp = uhd::usrp::multi_usrp::make(args);
+
+    // Lock mboard clocks
+    if (vm.count("ref")) {
+        usrp->set_clock_source(ref);
+    }
+
+    if (vm.count("subdev"))
+        usrp->set_rx_subdev_spec(subdev);
+
+    std::cout << boost::format("Using Device: %s") % usrp->get_pp_string() << std::endl;
+
+    // Set sample rate
+    if (rate <= 0.0) {
+        std::cerr << "Please specify a valid sample rate" << std::endl;
+        return ~0;
+    }
+    std::cout << boost::format("Setting RX Rate: %f Msps...") % (rate / 1e6) << std::endl;
+    usrp->set_rx_rate(rate, channel);
+    std::cout << boost::format("Actual RX Rate: %f Msps...") % (usrp->get_rx_rate(channel) / 1e6) << std::endl;
+
+    // Set center frequency
+    if (vm.count("freq")) {
+        std::cout << boost::format("Setting RX Freq: %f MHz...") % (freq / 1e6) << std::endl;
+        uhd::tune_request_t tune_request(freq, lo_offset);
+        usrp->set_rx_freq(tune_request, channel);
+        std::cout << boost::format("Actual RX Freq: %f MHz...") % (usrp->get_rx_freq(channel) / 1e6) << std::endl;
+    }
+
+    // Set RF gain
+    if (vm.count("gain")) {
+        std::cout << boost::format("Setting RX Gain: %f dB...") % gain << std::endl;
+        usrp->set_rx_gain(gain, channel);
+        std::cout << boost::format("Actual RX Gain: %f dB...") % usrp->get_rx_gain(channel) << std::endl;
+    }
+
+    // Set IF filter bandwidth
+    if (vm.count("bw")) {
+        std::cout << boost::format("Setting RX Bandwidth: %f MHz...") % (bw / 1e6) << std::endl;
+        usrp->set_rx_bandwidth(bw, channel);
+        std::cout << boost::format("Actual RX Bandwidth: %f MHz...") % (usrp->get_rx_bandwidth(channel) / 1e6) << std::endl;
+    }
+
+    // Set antenna
+    if (vm.count("ant"))
+        usrp->set_rx_antenna(ant, channel);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(int64_t(1000 * setup_time)));
+
+    // Check LO lock
+    if (!vm.count("skip-lo")) {
+        check_locked_sensor(usrp->get_rx_sensor_names(channel),
+            "lo_locked",
+            [usrp, channel](const std::string& sensor_name) {
+                return usrp->get_rx_sensor(sensor_name, channel);
+            },
+            setup_time);
+    }
+
+    std::signal(SIGINT, &sig_int_handler);
+    std::cout << "Press Ctrl + C to stop..." << std::endl;
+
+    // Run triggered receive
+    if (wirefmt == "s16") {
+        throw std::runtime_error("Triggered mode requires complex samples (sc16, sc8)");
+    } else {
+        if (type == "double")
+            recv_to_file_triggered<std::complex<double>>(usrp, "fc64", wirefmt, channel, file, spb,
+                total_time, threshold, hyst, detect_dur, pre_trig_time, null, continue_on_bad_packet);
+        else if (type == "float")
+            recv_to_file_triggered<std::complex<float>>(usrp, "fc32", wirefmt, channel, file, spb,
+                total_time, threshold, hyst, detect_dur, pre_trig_time, null, continue_on_bad_packet);
+        else if (type == "short")
+            recv_to_file_triggered<std::complex<short>>(usrp, "sc16", wirefmt, channel, file, spb,
+                total_time, threshold, hyst, detect_dur, pre_trig_time, null, continue_on_bad_packet);
+        else
+            throw std::runtime_error("Unknown type " + type);
+    }
+
+    std::cout << std::endl << "Done!" << std::endl << std::endl;
+    return EXIT_SUCCESS;
+}
