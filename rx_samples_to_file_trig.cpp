@@ -148,13 +148,12 @@ void recv_to_file_triggered(
     size_t pre_trig_write_idx = 0;
     bool pre_trig_full = false;
 
-    // Pre-allocate RAM buffer for recording (pre-trigger + recording duration)
-    size_t total_samples = pre_trig_samples + recording_samples;
+    // Pre-allocate RAM buffer for post-trigger recording only
     std::vector<samp_type> ram_buffer;
 
-    std::cout << "Pre-allocating RAM buffer for " << total_samples << " samples ("
-              << (total_samples * sizeof(samp_type) / 1e6) << " MB)..." << std::endl;
-    ram_buffer.resize(total_samples);
+    std::cout << "Pre-allocating RAM buffer for " << recording_samples << " samples ("
+              << (recording_samples * sizeof(samp_type) / 1e6) << " MB)..." << std::endl;
+    ram_buffer.resize(recording_samples);
     std::cout << "RAM buffer allocated." << std::endl;
 
     // Start detection thread
@@ -227,36 +226,18 @@ void recv_to_file_triggered(
     }
 
     // === POST-TRIGGER PHASE ===
-    // Copy pre-trigger buffer to RAM (unwrap circular buffer)
-    size_t pre_trig_copied = 0;
-    if (pre_trig_full) {
-        // Buffer wrapped - copy from write_idx to end, then start to write_idx
-        for (size_t i = pre_trig_write_idx; i < pre_trig_samples; i++) {
-            ram_buffer[pre_trig_copied++] = pre_trig_buffer[i];
-        }
-        for (size_t i = 0; i < pre_trig_write_idx; i++) {
-            ram_buffer[pre_trig_copied++] = pre_trig_buffer[i];
-        }
-    } else {
-        // Buffer not full - copy from start to write_idx
-        for (size_t i = 0; i < pre_trig_write_idx; i++) {
-            ram_buffer[pre_trig_copied++] = pre_trig_buffer[i];
-        }
-    }
-    std::cout << "Copied " << pre_trig_copied << " pre-trigger samples" << std::endl;
-
-    // Record for the requested duration
-    size_t num_total_samps = pre_trig_copied;
+    // Record immediately - pre-trigger buffer will be stitched at file write time
+    size_t num_total_samps = 0;
     const auto start_time = std::chrono::steady_clock::now();
     const auto stop_time = start_time + std::chrono::milliseconds(int64_t(1000 * time_requested));
 
     std::cout << "Recording..." << std::endl;
 
     while (!stop_signal_called &&
-           num_total_samps < total_samples &&
+           num_total_samps < recording_samples &&
            std::chrono::steady_clock::now() <= stop_time) {
 
-        size_t remaining = total_samples - num_total_samps;
+        size_t remaining = recording_samples - num_total_samps;
         size_t to_recv = std::min(samps_per_buff, remaining);
 
         size_t num_rx_samps = rx_stream->recv(
@@ -283,15 +264,35 @@ void recv_to_file_triggered(
 
     std::cout << "\nRecording complete. Total samples: " << num_total_samps << std::endl;
 
-    // Write to file
-    if (!null && num_total_samps > 0) {
-        std::cout << "Writing to file..." << std::endl;
+    // Write to file - stitch pre-trigger + recording buffers
+    if (!null) {
+        size_t pre_trig_count = pre_trig_full ? pre_trig_samples : pre_trig_write_idx;
+        size_t total_written = pre_trig_count + num_total_samps;
+
+        std::cout << "Writing to file: " << pre_trig_count << " pre-trigger + "
+                  << num_total_samps << " recorded = " << total_written << " samples" << std::endl;
+
         const auto write_start = std::chrono::steady_clock::now();
 
         std::ofstream outfile(file.c_str(), std::ofstream::binary);
         if (!outfile.is_open()) {
             throw std::runtime_error("Failed to open output file");
         }
+
+        // Write pre-trigger buffer (unwrap circular buffer)
+        if (pre_trig_full) {
+            // Buffer wrapped - write from write_idx to end, then start to write_idx
+            outfile.write(reinterpret_cast<const char*>(&pre_trig_buffer[pre_trig_write_idx]),
+                          (pre_trig_samples - pre_trig_write_idx) * sizeof(samp_type));
+            outfile.write(reinterpret_cast<const char*>(&pre_trig_buffer[0]),
+                          pre_trig_write_idx * sizeof(samp_type));
+        } else {
+            // Buffer not full - write from start to write_idx
+            outfile.write(reinterpret_cast<const char*>(&pre_trig_buffer[0]),
+                          pre_trig_write_idx * sizeof(samp_type));
+        }
+
+        // Write post-trigger recording
         outfile.write(reinterpret_cast<const char*>(ram_buffer.data()),
                       num_total_samps * sizeof(samp_type));
         outfile.close();
