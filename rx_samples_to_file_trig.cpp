@@ -28,6 +28,26 @@
 
 namespace po = boost::program_options;
 
+// Generate RFC3339 timestamp with milliseconds
+std::string get_timestamp_ms() {
+    auto now = std::chrono::system_clock::now();
+    auto now_t = std::chrono::system_clock::to_time_t(now);
+    auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        now.time_since_epoch()) % 1000;
+    std::tm* now_tm = std::gmtime(&now_t);
+    char buf[32];
+    std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H-%M-%S", now_tm);
+    return std::string(buf) + "." + std::to_string(now_ms.count()) + "Z";
+}
+
+// Generate filename from parameters
+std::string generate_filename(const std::string& output_dir, const std::string& hostname,
+    const std::string& datetime, double freq, double rate, double duration,
+    double gain, const std::string& desc) {
+    return str(boost::format("%s/iq_capture_%s_%s_%.0fMHz_%.1fMsps_%.1fs_%.0fdB_%s.dat")
+        % output_dir % hostname % datetime % (freq/1e6) % (rate/1e6) % duration % gain % desc);
+}
+
 // Global state
 static bool stop_signal_called = false;
 static std::atomic<bool> triggered{false};
@@ -107,7 +127,7 @@ void recv_to_file_triggered(
     const std::string& cpu_format,
     const std::string& wire_format,
     const size_t& channel,
-    const std::string& file,
+    std::string file,
     size_t samps_per_buff,
     double time_requested,
     double threshold,
@@ -115,7 +135,12 @@ void recv_to_file_triggered(
     double detect_dur,
     double pre_trig_time,
     bool null,
-    bool continue_on_bad_packet)
+    bool continue_on_bad_packet,
+    const std::string& output_dir,
+    const std::string& hostname,
+    double freq,
+    double gain,
+    const std::string& file_desc)
 {
     // Create receive streamer
     uhd::stream_args_t stream_args(cpu_format, wire_format);
@@ -227,6 +252,14 @@ void recv_to_file_triggered(
     }
 
     // === POST-TRIGGER PHASE ===
+    // Generate filename if auto-filename mode (file is empty)
+    if (file.empty() && !null) {
+        std::string start_time = get_timestamp_ms();
+        file = generate_filename(output_dir, hostname, start_time, freq,
+            usrp->get_rx_rate(channel), time_requested, gain, file_desc);
+        std::cout << "Output file: " << file << std::endl;
+    }
+
     // Record immediately - pre-trigger buffer will be stitched at file write time
     size_t num_total_samps = 0;
     const auto start_time = std::chrono::steady_clock::now();
@@ -311,11 +344,16 @@ void recv_to_file_immediate(
     const std::string& cpu_format,
     const std::string& wire_format,
     const size_t& channel,
-    const std::string& file,
+    std::string file,
     size_t samps_per_buff,
     double time_requested,
     bool null,
-    bool continue_on_bad_packet)
+    bool continue_on_bad_packet,
+    const std::string& output_dir,
+    const std::string& hostname,
+    double freq,
+    double gain,
+    const std::string& file_desc)
 {
     // Create receive streamer
     uhd::stream_args_t stream_args(cpu_format, wire_format);
@@ -339,6 +377,14 @@ void recv_to_file_immediate(
     uhd::stream_cmd_t stream_cmd(uhd::stream_cmd_t::STREAM_MODE_START_CONTINUOUS);
     stream_cmd.stream_now = true;
     rx_stream->issue_stream_cmd(stream_cmd);
+
+    // Generate filename if auto-filename mode (file is empty)
+    if (file.empty() && !null) {
+        std::string start_time = get_timestamp_ms();
+        file = generate_filename(output_dir, hostname, start_time, freq,
+            sample_rate, time_requested, gain, file_desc);
+        std::cout << "Output file: " << file << std::endl;
+    }
 
     size_t num_total_samps = 0;
     const auto start_time = std::chrono::steady_clock::now();
@@ -493,25 +539,20 @@ int UHD_SAFE_MAIN(int argc, char* argv[])
     bool null = vm.count("null") > 0;
     bool continue_on_bad_packet = vm.count("continue") > 0;
     bool trig_enabled = vm.count("trig") > 0;
+    bool auto_filename = !vm.count("file") && !null;
 
-    // Generate filename if not provided
-    if (!vm.count("file") && !null) {
-        if (!vm.count("desc")) {
-            std::cerr << "Error: --desc required when --file not specified" << std::endl;
-            return ~0;
-        }
-        // Get hostname
-        char hostname[256];
-        if (gethostname(hostname, sizeof(hostname)) != 0) {
-            strncpy(hostname, "unknown", sizeof(hostname));
-        }
-        // Get gain value (default to 0 if not specified)
-        double gain_val = vm.count("gain") ? gain : 0.0;
-        // Format: iq_capture_<hostname>_<freq_MHz>_<rate_Msps>_<dur_s>_<gain_dB>_<desc>.dat
-        file = str(boost::format("%s/iq_capture_%s_%.0fMHz_%.1fMsps_%.1fs_%.0fdB_%s.dat")
-            % output_dir % hostname % (freq/1e6) % (rate/1e6) % total_time % gain_val % file_desc);
-        std::cout << "Output file: " << file << std::endl;
+    // Validate auto-filename requirements
+    if (auto_filename && !vm.count("desc")) {
+        std::cerr << "Error: --desc required when --file not specified" << std::endl;
+        return ~0;
     }
+
+    // Get hostname for auto-filename
+    char hostname[256];
+    if (gethostname(hostname, sizeof(hostname)) != 0) {
+        strncpy(hostname, "unknown", sizeof(hostname));
+    }
+    double gain_val = vm.count("gain") ? gain : 0.0;
 
     // Create USRP device
     std::cout << std::endl;
@@ -582,30 +623,39 @@ int UHD_SAFE_MAIN(int argc, char* argv[])
         throw std::runtime_error("This tool requires complex samples (sc16, sc8)");
     }
 
+    // Pass empty file string if auto-filename mode
+    std::string output_file = auto_filename ? "" : file;
+
     if (trig_enabled) {
         // Triggered recording mode
         if (type == "double")
-            recv_to_file_triggered<std::complex<double>>(usrp, "fc64", wirefmt, channel, file, spb,
-                total_time, threshold, hyst, detect_dur, pre_trig_time, null, continue_on_bad_packet);
+            recv_to_file_triggered<std::complex<double>>(usrp, "fc64", wirefmt, channel, output_file, spb,
+                total_time, threshold, hyst, detect_dur, pre_trig_time, null, continue_on_bad_packet,
+                output_dir, hostname, freq, gain_val, file_desc);
         else if (type == "float")
-            recv_to_file_triggered<std::complex<float>>(usrp, "fc32", wirefmt, channel, file, spb,
-                total_time, threshold, hyst, detect_dur, pre_trig_time, null, continue_on_bad_packet);
+            recv_to_file_triggered<std::complex<float>>(usrp, "fc32", wirefmt, channel, output_file, spb,
+                total_time, threshold, hyst, detect_dur, pre_trig_time, null, continue_on_bad_packet,
+                output_dir, hostname, freq, gain_val, file_desc);
         else if (type == "short")
-            recv_to_file_triggered<std::complex<short>>(usrp, "sc16", wirefmt, channel, file, spb,
-                total_time, threshold, hyst, detect_dur, pre_trig_time, null, continue_on_bad_packet);
+            recv_to_file_triggered<std::complex<short>>(usrp, "sc16", wirefmt, channel, output_file, spb,
+                total_time, threshold, hyst, detect_dur, pre_trig_time, null, continue_on_bad_packet,
+                output_dir, hostname, freq, gain_val, file_desc);
         else
             throw std::runtime_error("Unknown type " + type);
     } else {
         // Immediate recording mode (no trigger)
         if (type == "double")
-            recv_to_file_immediate<std::complex<double>>(usrp, "fc64", wirefmt, channel, file, spb,
-                total_time, null, continue_on_bad_packet);
+            recv_to_file_immediate<std::complex<double>>(usrp, "fc64", wirefmt, channel, output_file, spb,
+                total_time, null, continue_on_bad_packet,
+                output_dir, hostname, freq, gain_val, file_desc);
         else if (type == "float")
-            recv_to_file_immediate<std::complex<float>>(usrp, "fc32", wirefmt, channel, file, spb,
-                total_time, null, continue_on_bad_packet);
+            recv_to_file_immediate<std::complex<float>>(usrp, "fc32", wirefmt, channel, output_file, spb,
+                total_time, null, continue_on_bad_packet,
+                output_dir, hostname, freq, gain_val, file_desc);
         else if (type == "short")
-            recv_to_file_immediate<std::complex<short>>(usrp, "sc16", wirefmt, channel, file, spb,
-                total_time, null, continue_on_bad_packet);
+            recv_to_file_immediate<std::complex<short>>(usrp, "sc16", wirefmt, channel, output_file, spb,
+                total_time, null, continue_on_bad_packet,
+                output_dir, hostname, freq, gain_val, file_desc);
         else
             throw std::runtime_error("Unknown type " + type);
     }
