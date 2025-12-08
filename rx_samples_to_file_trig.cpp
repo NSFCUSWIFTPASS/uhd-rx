@@ -23,7 +23,9 @@
 #include <mutex>
 #include <condition_variable>
 #include <atomic>
+#include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <unistd.h>
 
 namespace po = boost::program_options;
@@ -85,6 +87,28 @@ double compute_mean_power_db(const samp_type* samples, size_t count)
     return 10.0 * std::log10(mean_power + 1e-20);  // 10*log10 for power
 }
 
+// Top N tracker for highest power values
+static std::vector<double> top_powers;
+static const size_t TOP_N = 10;
+
+void update_top_powers(double power_db) {
+    if (top_powers.size() < TOP_N) {
+        top_powers.push_back(power_db);
+        std::sort(top_powers.begin(), top_powers.end(), std::greater<double>());
+    } else if (power_db > top_powers.back()) {
+        top_powers.back() = power_db;
+        std::sort(top_powers.begin(), top_powers.end(), std::greater<double>());
+    }
+}
+
+void print_top_powers() {
+    if (top_powers.empty()) return;
+    std::cout << "\nTop " << top_powers.size() << " highest power readings:" << std::endl;
+    for (size_t i = 0; i < top_powers.size(); i++) {
+        std::cout << "  " << (i + 1) << ". " << top_powers[i] << " dB" << std::endl;
+    }
+}
+
 // Detection thread function
 template <typename samp_type>
 void detection_thread_fn(
@@ -105,6 +129,9 @@ void detection_thread_fn(
         // Compute mean power in dB
         double avg_db = compute_mean_power_db(process_buf->data(), *process_count);
         *process_count = 0;  // Mark as processed
+
+        // Track top powers
+        update_top_powers(avg_db);
 
         // Threshold check with hysteresis
         if (avg_db > threshold) {
@@ -228,11 +255,20 @@ void recv_to_file_triggered(
             else throw std::runtime_error(md.strerror());
         }
 
-        // Copy to circular pre-trigger buffer
-        for (size_t i = 0; i < num_rx_samps; i++) {
-            pre_trig_buffer[pre_trig_write_idx] = (*active_buf)[active_buf_idx + i];
-            pre_trig_write_idx = (pre_trig_write_idx + 1) % pre_trig_samples;
-            if (pre_trig_write_idx == 0) pre_trig_full = true;
+        // Copy to circular pre-trigger buffer using bulk memcpy
+        const samp_type* src = &(*active_buf)[active_buf_idx];
+        size_t remaining = num_rx_samps;
+        while (remaining > 0) {
+            size_t space_to_end = pre_trig_samples - pre_trig_write_idx;
+            size_t to_copy = std::min(remaining, space_to_end);
+            std::memcpy(&pre_trig_buffer[pre_trig_write_idx], src, to_copy * sizeof(samp_type));
+            src += to_copy;
+            remaining -= to_copy;
+            pre_trig_write_idx += to_copy;
+            if (pre_trig_write_idx >= pre_trig_samples) {
+                pre_trig_write_idx = 0;
+                pre_trig_full = true;
+            }
         }
 
         active_buf_idx += num_rx_samps;
@@ -253,6 +289,9 @@ void recv_to_file_triggered(
     detection_thread_running = false;
     buf_ready.notify_all();
     detector.join();
+
+    // Print top power readings
+    print_top_powers();
 
     if (!triggered) {
         std::cout << "\nStopped without trigger." << std::endl;
