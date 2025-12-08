@@ -140,7 +140,9 @@ void recv_to_file_triggered(
     const std::string& hostname,
     double freq,
     double gain,
-    const std::string& file_desc)
+    const std::string& file_desc,
+    int skip_first,
+    int start_retries)
 {
     // Create receive streamer
     uhd::stream_args_t stream_args(cpu_format, wire_format);
@@ -186,10 +188,18 @@ void recv_to_file_triggered(
     std::thread detector(detection_thread_fn<samp_type>,
                         process_buf, &process_count, threshold, hyst);
 
+    // Temp buffer for skip/warmup
+    std::vector<samp_type> temp_buf(samps_per_buff);
+
     // Start continuous streaming
     uhd::stream_cmd_t stream_cmd(uhd::stream_cmd_t::STREAM_MODE_START_CONTINUOUS);
     stream_cmd.stream_now = true;
     rx_stream->issue_stream_cmd(stream_cmd);
+
+    // Skip first recv() calls (warm-up)
+    for (int i = 0; i < skip_first; i++) {
+        rx_stream->recv(temp_buf.data(), samps_per_buff, md, 3.0, false);
+    }
 
     std::cout << "\nWaiting for trigger (threshold=" << threshold << ", hyst=" << hyst << ")..." << std::endl;
 
@@ -252,16 +262,44 @@ void recv_to_file_triggered(
     }
 
     // === POST-TRIGGER PHASE ===
+    // Retry logic at start of recording
+    bool had_overflow = false;
+    int start_attempts = 0;
+    std::string recording_start_time;
+    size_t num_total_samps = 0;
+
+    while (start_attempts < start_retries && !stop_signal_called) {
+        start_attempts++;
+        num_total_samps = 0;
+
+        size_t num_rx_samps = rx_stream->recv(
+            ram_buffer.data(), samps_per_buff, md, 3.0, false);
+
+        if (md.error_code == uhd::rx_metadata_t::ERROR_CODE_OVERFLOW) {
+            std::cout << "Overflow at recording start, retrying (" << start_attempts << "/" << start_retries << ")" << std::endl;
+            continue;
+        }
+
+        // Clean start - capture timestamp now
+        recording_start_time = get_timestamp_ms();
+        num_total_samps = num_rx_samps;
+        break;
+    }
+
+    if (start_attempts >= start_retries && num_total_samps == 0) {
+        std::cerr << "Failed to start recording cleanly after " << start_retries << " attempts" << std::endl;
+        stream_cmd.stream_mode = uhd::stream_cmd_t::STREAM_MODE_STOP_CONTINUOUS;
+        rx_stream->issue_stream_cmd(stream_cmd);
+        return;
+    }
+
     // Generate filename if auto-filename mode (file is empty)
     if (file.empty() && !null) {
-        std::string start_time = get_timestamp_ms();
-        file = generate_filename(output_dir, hostname, start_time, freq,
+        file = generate_filename(output_dir, hostname, recording_start_time, freq,
             usrp->get_rx_rate(channel), time_requested, gain, file_desc);
         std::cout << "Output file: " << file << std::endl;
     }
 
-    // Record immediately - pre-trigger buffer will be stitched at file write time
-    size_t num_total_samps = 0;
     const auto start_time = std::chrono::steady_clock::now();
     const auto stop_time = start_time + std::chrono::milliseconds(int64_t(1000 * time_requested));
 
@@ -281,6 +319,7 @@ void recv_to_file_triggered(
 
         if (md.error_code == uhd::rx_metadata_t::ERROR_CODE_TIMEOUT) break;
         if (md.error_code == uhd::rx_metadata_t::ERROR_CODE_OVERFLOW) {
+            had_overflow = true;
             std::cerr << "Overflow during recording!" << std::endl;
             continue;
         }
@@ -297,6 +336,15 @@ void recv_to_file_triggered(
     rx_stream->issue_stream_cmd(stream_cmd);
 
     std::cout << "\nRecording complete. Total samples: " << num_total_samps << std::endl;
+
+    // Add OVF to filename if overflow occurred
+    if (had_overflow && !file.empty()) {
+        size_t dot_pos = file.rfind(".dat");
+        if (dot_pos != std::string::npos) {
+            file.insert(dot_pos, "_OVF");
+        }
+        std::cout << "Warning: Overflow occurred, file renamed to: " << file << std::endl;
+    }
 
     // Write to file - stitch pre-trigger + recording buffers
     if (!null) {
@@ -353,7 +401,9 @@ void recv_to_file_immediate(
     const std::string& hostname,
     double freq,
     double gain,
-    const std::string& file_desc)
+    const std::string& file_desc,
+    int skip_first,
+    int start_retries)
 {
     // Create receive streamer
     uhd::stream_args_t stream_args(cpu_format, wire_format);
@@ -373,20 +423,57 @@ void recv_to_file_immediate(
     ram_buffer.resize(recording_samples);
     std::cout << "RAM buffer allocated." << std::endl;
 
+    // Temp buffer for skip/warmup
+    std::vector<samp_type> temp_buf(samps_per_buff);
+
     // Start continuous streaming
     uhd::stream_cmd_t stream_cmd(uhd::stream_cmd_t::STREAM_MODE_START_CONTINUOUS);
     stream_cmd.stream_now = true;
     rx_stream->issue_stream_cmd(stream_cmd);
 
+    // Skip first recv() calls (warm-up)
+    for (int i = 0; i < skip_first; i++) {
+        rx_stream->recv(temp_buf.data(), samps_per_buff, md, 3.0, false);
+    }
+
+    // Retry logic at start
+    bool had_overflow = false;
+    int start_attempts = 0;
+    std::string recording_start_time;
+    size_t num_total_samps = 0;
+
+    while (start_attempts < start_retries && !stop_signal_called) {
+        start_attempts++;
+        num_total_samps = 0;
+
+        size_t num_rx_samps = rx_stream->recv(
+            ram_buffer.data(), samps_per_buff, md, 3.0, false);
+
+        if (md.error_code == uhd::rx_metadata_t::ERROR_CODE_OVERFLOW) {
+            std::cout << "Overflow at start, retrying (" << start_attempts << "/" << start_retries << ")" << std::endl;
+            continue;
+        }
+
+        // Clean start - capture timestamp now
+        recording_start_time = get_timestamp_ms();
+        num_total_samps = num_rx_samps;
+        break;
+    }
+
+    if (start_attempts >= start_retries && num_total_samps == 0) {
+        std::cerr << "Failed to start cleanly after " << start_retries << " attempts" << std::endl;
+        stream_cmd.stream_mode = uhd::stream_cmd_t::STREAM_MODE_STOP_CONTINUOUS;
+        rx_stream->issue_stream_cmd(stream_cmd);
+        return;
+    }
+
     // Generate filename if auto-filename mode (file is empty)
     if (file.empty() && !null) {
-        std::string start_time = get_timestamp_ms();
-        file = generate_filename(output_dir, hostname, start_time, freq,
+        file = generate_filename(output_dir, hostname, recording_start_time, freq,
             sample_rate, time_requested, gain, file_desc);
         std::cout << "Output file: " << file << std::endl;
     }
 
-    size_t num_total_samps = 0;
     const auto start_time = std::chrono::steady_clock::now();
     const auto stop_time = start_time + std::chrono::milliseconds(int64_t(1000 * time_requested));
 
@@ -406,6 +493,7 @@ void recv_to_file_immediate(
 
         if (md.error_code == uhd::rx_metadata_t::ERROR_CODE_TIMEOUT) break;
         if (md.error_code == uhd::rx_metadata_t::ERROR_CODE_OVERFLOW) {
+            had_overflow = true;
             std::cerr << "Overflow during recording!" << std::endl;
             continue;
         }
@@ -422,6 +510,15 @@ void recv_to_file_immediate(
     rx_stream->issue_stream_cmd(stream_cmd);
 
     std::cout << "\nRecording complete. Total samples: " << num_total_samps << std::endl;
+
+    // Add OVF to filename if overflow occurred
+    if (had_overflow && !file.empty()) {
+        size_t dot_pos = file.rfind(".dat");
+        if (dot_pos != std::string::npos) {
+            file.insert(dot_pos, "_OVF");
+        }
+        std::cout << "Warning: Overflow occurred, file renamed to: " << file << std::endl;
+    }
 
     // Write to file
     if (!null && num_total_samps > 0) {
@@ -492,7 +589,7 @@ int UHD_SAFE_MAIN(int argc, char* argv[])
     size_t channel, spb;
     double rate, freq, gain, bw, total_time, setup_time, lo_offset;
     double threshold, detect_dur, pre_trig_time;
-    int hyst;
+    int hyst, skip_first, start_retries;
 
     // Setup program options
     po::options_description desc("Allowed options");
@@ -524,6 +621,9 @@ int UHD_SAFE_MAIN(int argc, char* argv[])
         ("hyst", po::value<int>(&hyst)->default_value(3), "hysteresis count for trigger")
         ("detect-dur", po::value<double>(&detect_dur)->default_value(0.5), "detection window duration (seconds)")
         ("pre-trig", po::value<double>(&pre_trig_time)->default_value(1.0), "pre-trigger buffer (seconds)")
+        // Overflow handling
+        ("skip-first", po::value<int>(&skip_first)->default_value(1), "skip first N recv() calls (warm-up)")
+        ("start-retries", po::value<int>(&start_retries)->default_value(3), "max retries at start on overflow")
     ;
 
     po::variables_map vm;
@@ -631,15 +731,15 @@ int UHD_SAFE_MAIN(int argc, char* argv[])
         if (type == "double")
             recv_to_file_triggered<std::complex<double>>(usrp, "fc64", wirefmt, channel, output_file, spb,
                 total_time, threshold, hyst, detect_dur, pre_trig_time, null, continue_on_bad_packet,
-                output_dir, hostname, freq, gain_val, file_desc);
+                output_dir, hostname, freq, gain_val, file_desc, skip_first, start_retries);
         else if (type == "float")
             recv_to_file_triggered<std::complex<float>>(usrp, "fc32", wirefmt, channel, output_file, spb,
                 total_time, threshold, hyst, detect_dur, pre_trig_time, null, continue_on_bad_packet,
-                output_dir, hostname, freq, gain_val, file_desc);
+                output_dir, hostname, freq, gain_val, file_desc, skip_first, start_retries);
         else if (type == "short")
             recv_to_file_triggered<std::complex<short>>(usrp, "sc16", wirefmt, channel, output_file, spb,
                 total_time, threshold, hyst, detect_dur, pre_trig_time, null, continue_on_bad_packet,
-                output_dir, hostname, freq, gain_val, file_desc);
+                output_dir, hostname, freq, gain_val, file_desc, skip_first, start_retries);
         else
             throw std::runtime_error("Unknown type " + type);
     } else {
@@ -647,15 +747,15 @@ int UHD_SAFE_MAIN(int argc, char* argv[])
         if (type == "double")
             recv_to_file_immediate<std::complex<double>>(usrp, "fc64", wirefmt, channel, output_file, spb,
                 total_time, null, continue_on_bad_packet,
-                output_dir, hostname, freq, gain_val, file_desc);
+                output_dir, hostname, freq, gain_val, file_desc, skip_first, start_retries);
         else if (type == "float")
             recv_to_file_immediate<std::complex<float>>(usrp, "fc32", wirefmt, channel, output_file, spb,
                 total_time, null, continue_on_bad_packet,
-                output_dir, hostname, freq, gain_val, file_desc);
+                output_dir, hostname, freq, gain_val, file_desc, skip_first, start_retries);
         else if (type == "short")
             recv_to_file_immediate<std::complex<short>>(usrp, "sc16", wirefmt, channel, output_file, spb,
                 total_time, null, continue_on_bad_packet,
-                output_dir, hostname, freq, gain_val, file_desc);
+                output_dir, hostname, freq, gain_val, file_desc, skip_first, start_retries);
         else
             throw std::runtime_error("Unknown type " + type);
     }
