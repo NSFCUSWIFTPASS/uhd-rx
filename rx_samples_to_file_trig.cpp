@@ -24,6 +24,7 @@
 #include <condition_variable>
 #include <atomic>
 #include <cmath>
+#include <unistd.h>
 
 namespace po = boost::program_options;
 
@@ -441,7 +442,7 @@ bool check_locked_sensor(std::vector<std::string> sensor_names,
 int UHD_SAFE_MAIN(int argc, char* argv[])
 {
     // Variables to be set by program options
-    std::string args, file, type, ant, subdev, ref, wirefmt;
+    std::string args, file, type, ant, subdev, ref, wirefmt, file_desc, output_dir;
     size_t channel, spb;
     double rate, freq, gain, bw, total_time, setup_time, lo_offset;
     double threshold, detect_dur, pre_trig_time;
@@ -452,7 +453,9 @@ int UHD_SAFE_MAIN(int argc, char* argv[])
     desc.add_options()
         ("help", "help message")
         ("args", po::value<std::string>(&args)->default_value(""), "multi uhd device address args")
-        ("file", po::value<std::string>(&file)->default_value("usrp_samples.dat"), "output file")
+        ("file", po::value<std::string>(&file), "output file (auto-generated if not specified)")
+        ("desc", po::value<std::string>(&file_desc), "description tag for auto-filename (required if --file not specified)")
+        ("dir", po::value<std::string>(&output_dir)->default_value("."), "output directory for auto-filename")
         ("type", po::value<std::string>(&type)->default_value("short"), "sample type: double, float, or short")
         ("duration", po::value<double>(&total_time)->default_value(5.0), "recording duration after trigger (seconds)")
         ("spb", po::value<size_t>(&spb)->default_value(10000), "samples per buffer")
@@ -489,8 +492,26 @@ int UHD_SAFE_MAIN(int argc, char* argv[])
 
     bool null = vm.count("null") > 0;
     bool continue_on_bad_packet = vm.count("continue") > 0;
-
     bool trig_enabled = vm.count("trig") > 0;
+
+    // Generate filename if not provided
+    if (!vm.count("file") && !null) {
+        if (!vm.count("desc")) {
+            std::cerr << "Error: --desc required when --file not specified" << std::endl;
+            return ~0;
+        }
+        // Get hostname
+        char hostname[256];
+        if (gethostname(hostname, sizeof(hostname)) != 0) {
+            strncpy(hostname, "unknown", sizeof(hostname));
+        }
+        // Get gain value (default to 0 if not specified)
+        double gain_val = vm.count("gain") ? gain : 0.0;
+        // Format: iq_capture_<hostname>_<freq_MHz>_<rate_Msps>_<dur_s>_<gain_dB>_<desc>.dat
+        file = str(boost::format("%s/iq_capture_%s_%.0fMHz_%.1fMsps_%.1fs_%.0fdB_%s.dat")
+            % output_dir % hostname % (freq/1e6) % (rate/1e6) % total_time % gain_val % file_desc);
+        std::cout << "Output file: " << file << std::endl;
+    }
 
     // Create USRP device
     std::cout << std::endl;
