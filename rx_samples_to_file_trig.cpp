@@ -303,6 +303,98 @@ void recv_to_file_triggered(
     }
 }
 
+// Immediate recording (no trigger) - record directly to RAM for duration
+template <typename samp_type>
+void recv_to_file_immediate(
+    uhd::usrp::multi_usrp::sptr usrp,
+    const std::string& cpu_format,
+    const std::string& wire_format,
+    const size_t& channel,
+    const std::string& file,
+    size_t samps_per_buff,
+    double time_requested,
+    bool null,
+    bool continue_on_bad_packet)
+{
+    // Create receive streamer
+    uhd::stream_args_t stream_args(cpu_format, wire_format);
+    std::vector<size_t> channel_nums;
+    channel_nums.push_back(channel);
+    stream_args.channels = channel_nums;
+    uhd::rx_streamer::sptr rx_stream = usrp->get_rx_stream(stream_args);
+
+    uhd::rx_metadata_t md;
+    double sample_rate = usrp->get_rx_rate(channel);
+    size_t recording_samples = static_cast<size_t>(time_requested * sample_rate);
+
+    // Pre-allocate RAM buffer
+    std::vector<samp_type> ram_buffer;
+    std::cout << "Allocating RAM buffer for " << recording_samples << " samples ("
+              << (recording_samples * sizeof(samp_type) / 1e6) << " MB)..." << std::endl;
+    ram_buffer.resize(recording_samples);
+    std::cout << "RAM buffer allocated." << std::endl;
+
+    // Start continuous streaming
+    uhd::stream_cmd_t stream_cmd(uhd::stream_cmd_t::STREAM_MODE_START_CONTINUOUS);
+    stream_cmd.stream_now = true;
+    rx_stream->issue_stream_cmd(stream_cmd);
+
+    size_t num_total_samps = 0;
+    const auto start_time = std::chrono::steady_clock::now();
+    const auto stop_time = start_time + std::chrono::milliseconds(int64_t(1000 * time_requested));
+
+    std::cout << "Recording for " << time_requested << " seconds..." << std::endl;
+
+    while (!stop_signal_called &&
+           num_total_samps < recording_samples &&
+           std::chrono::steady_clock::now() <= stop_time) {
+
+        size_t remaining = recording_samples - num_total_samps;
+        size_t to_recv = std::min(samps_per_buff, remaining);
+
+        size_t num_rx_samps = rx_stream->recv(
+            &ram_buffer[num_total_samps],
+            to_recv,
+            md, 3.0, false);
+
+        if (md.error_code == uhd::rx_metadata_t::ERROR_CODE_TIMEOUT) break;
+        if (md.error_code == uhd::rx_metadata_t::ERROR_CODE_OVERFLOW) {
+            std::cerr << "Overflow during recording!" << std::endl;
+            continue;
+        }
+        if (md.error_code != uhd::rx_metadata_t::ERROR_CODE_NONE) {
+            if (continue_on_bad_packet) continue;
+            else throw std::runtime_error(md.strerror());
+        }
+
+        num_total_samps += num_rx_samps;
+    }
+
+    // Stop streaming
+    stream_cmd.stream_mode = uhd::stream_cmd_t::STREAM_MODE_STOP_CONTINUOUS;
+    rx_stream->issue_stream_cmd(stream_cmd);
+
+    std::cout << "\nRecording complete. Total samples: " << num_total_samps << std::endl;
+
+    // Write to file
+    if (!null && num_total_samps > 0) {
+        std::cout << "Writing " << num_total_samps << " samples to file..." << std::endl;
+        const auto write_start = std::chrono::steady_clock::now();
+
+        std::ofstream outfile(file.c_str(), std::ofstream::binary);
+        if (!outfile.is_open()) {
+            throw std::runtime_error("Failed to open output file");
+        }
+        outfile.write(reinterpret_cast<const char*>(ram_buffer.data()),
+                      num_total_samps * sizeof(samp_type));
+        outfile.close();
+
+        const auto write_stop = std::chrono::steady_clock::now();
+        double write_duration = std::chrono::duration<double>(write_stop - write_start).count();
+        std::cout << "File write completed in " << write_duration << " seconds" << std::endl;
+    }
+}
+
 typedef std::function<uhd::sensor_value_t(const std::string&)> get_sensor_fn_t;
 
 bool check_locked_sensor(std::vector<std::string> sensor_names,
@@ -399,10 +491,6 @@ int UHD_SAFE_MAIN(int argc, char* argv[])
     bool continue_on_bad_packet = vm.count("continue") > 0;
 
     bool trig_enabled = vm.count("trig") > 0;
-    if (!trig_enabled) {
-        std::cerr << "Error: --trig threshold must be specified (in dB)" << std::endl;
-        return ~0;
-    }
 
     // Create USRP device
     std::cout << std::endl;
@@ -469,10 +557,12 @@ int UHD_SAFE_MAIN(int argc, char* argv[])
     std::signal(SIGINT, &sig_int_handler);
     std::cout << "Press Ctrl + C to stop..." << std::endl;
 
-    // Run triggered receive
     if (wirefmt == "s16") {
-        throw std::runtime_error("Triggered mode requires complex samples (sc16, sc8)");
-    } else {
+        throw std::runtime_error("This tool requires complex samples (sc16, sc8)");
+    }
+
+    if (trig_enabled) {
+        // Triggered recording mode
         if (type == "double")
             recv_to_file_triggered<std::complex<double>>(usrp, "fc64", wirefmt, channel, file, spb,
                 total_time, threshold, hyst, detect_dur, pre_trig_time, null, continue_on_bad_packet);
@@ -482,6 +572,19 @@ int UHD_SAFE_MAIN(int argc, char* argv[])
         else if (type == "short")
             recv_to_file_triggered<std::complex<short>>(usrp, "sc16", wirefmt, channel, file, spb,
                 total_time, threshold, hyst, detect_dur, pre_trig_time, null, continue_on_bad_packet);
+        else
+            throw std::runtime_error("Unknown type " + type);
+    } else {
+        // Immediate recording mode (no trigger)
+        if (type == "double")
+            recv_to_file_immediate<std::complex<double>>(usrp, "fc64", wirefmt, channel, file, spb,
+                total_time, null, continue_on_bad_packet);
+        else if (type == "float")
+            recv_to_file_immediate<std::complex<float>>(usrp, "fc32", wirefmt, channel, file, spb,
+                total_time, null, continue_on_bad_packet);
+        else if (type == "short")
+            recv_to_file_immediate<std::complex<short>>(usrp, "sc16", wirefmt, channel, file, spb,
+                total_time, null, continue_on_bad_packet);
         else
             throw std::runtime_error("Unknown type " + type);
     }
