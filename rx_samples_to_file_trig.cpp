@@ -300,15 +300,9 @@ void recv_to_file_triggered(
         std::cout << "Output file: " << file << std::endl;
     }
 
-    const auto start_time = std::chrono::steady_clock::now();
-    const auto stop_time = start_time + std::chrono::milliseconds(int64_t(1000 * time_requested));
-
     std::cout << "Recording..." << std::endl;
 
-    while (!stop_signal_called &&
-           num_total_samps < recording_samples &&
-           std::chrono::steady_clock::now() <= stop_time) {
-
+    while (!stop_signal_called && num_total_samps < recording_samples) {
         size_t remaining = recording_samples - num_total_samps;
         size_t to_recv = std::min(samps_per_buff, remaining);
 
@@ -319,8 +313,10 @@ void recv_to_file_triggered(
 
         if (md.error_code == uhd::rx_metadata_t::ERROR_CODE_TIMEOUT) break;
         if (md.error_code == uhd::rx_metadata_t::ERROR_CODE_OVERFLOW) {
-            had_overflow = true;
-            std::cerr << "Overflow during recording!" << std::endl;
+            if (!had_overflow) {
+                had_overflow = true;
+                std::cerr << "Overflow during recording!" << std::endl;
+            }
             continue;
         }
         if (md.error_code != uhd::rx_metadata_t::ERROR_CODE_NONE) {
@@ -474,15 +470,9 @@ void recv_to_file_immediate(
         std::cout << "Output file: " << file << std::endl;
     }
 
-    const auto start_time = std::chrono::steady_clock::now();
-    const auto stop_time = start_time + std::chrono::milliseconds(int64_t(1000 * time_requested));
-
     std::cout << "Recording for " << time_requested << " seconds..." << std::endl;
 
-    while (!stop_signal_called &&
-           num_total_samps < recording_samples &&
-           std::chrono::steady_clock::now() <= stop_time) {
-
+    while (!stop_signal_called && num_total_samps < recording_samples) {
         size_t remaining = recording_samples - num_total_samps;
         size_t to_recv = std::min(samps_per_buff, remaining);
 
@@ -493,8 +483,10 @@ void recv_to_file_immediate(
 
         if (md.error_code == uhd::rx_metadata_t::ERROR_CODE_TIMEOUT) break;
         if (md.error_code == uhd::rx_metadata_t::ERROR_CODE_OVERFLOW) {
-            had_overflow = true;
-            std::cerr << "Overflow during recording!" << std::endl;
+            if (!had_overflow) {
+                had_overflow = true;
+                std::cerr << "Overflow during recording!" << std::endl;
+            }
             continue;
         }
         if (md.error_code != uhd::rx_metadata_t::ERROR_CODE_NONE) {
@@ -601,7 +593,7 @@ int UHD_SAFE_MAIN(int argc, char* argv[])
         ("dir", po::value<std::string>(&output_dir)->default_value("."), "output directory for auto-filename")
         ("type", po::value<std::string>(&type)->default_value("short"), "sample type: double, float, or short")
         ("duration", po::value<double>(&total_time)->default_value(5.0), "recording duration after trigger (seconds)")
-        ("spb", po::value<size_t>(&spb)->default_value(10000), "samples per buffer")
+        ("spb", po::value<size_t>(&spb)->default_value(100000), "samples per buffer")
         ("rate", po::value<double>(&rate)->default_value(1e6), "sample rate (Hz)")
         ("freq", po::value<double>(&freq)->default_value(0.0), "RF center frequency (Hz)")
         ("lo-offset", po::value<double>(&lo_offset)->default_value(0.0), "LO offset (Hz)")
