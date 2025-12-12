@@ -54,6 +54,7 @@ std::string generate_filename(const std::string& output_dir, const std::string& 
 static bool stop_signal_called = false;
 static std::atomic<bool> triggered{false};
 static std::atomic<int> detection_count{0};
+static std::atomic<bool> enter_pressed{false};
 
 // Double buffer synchronization
 static std::mutex buf_mutex;
@@ -64,7 +65,15 @@ void sig_int_handler(int)
 {
     stop_signal_called = true;
     detection_thread_running = false;
+    enter_pressed = true;  // Also unblock wait mode
     buf_ready.notify_all();
+}
+
+// Thread function to wait for Enter key
+void wait_for_enter()
+{
+    std::cin.get();
+    enter_pressed = true;
 }
 
 // Compute mean power in dB for complex samples (matches Python implementation)
@@ -438,7 +447,8 @@ void recv_to_file_immediate(
     double gain,
     const std::string& file_desc,
     int skip_first,
-    int start_retries)
+    int start_retries,
+    bool wait_mode)
 {
     // Create receive streamer
     uhd::stream_args_t stream_args(cpu_format, wire_format);
@@ -469,6 +479,26 @@ void recv_to_file_immediate(
     // Skip first recv() calls (warm-up)
     for (int i = 0; i < skip_first; i++) {
         rx_stream->recv(temp_buf.data(), samps_per_buff, md, 3.0, false);
+    }
+
+    // Wait mode - discard samples until Enter is pressed
+    if (wait_mode) {
+        std::cout << "\nPress Enter to start recording..." << std::endl;
+        enter_pressed = false;
+        std::thread enter_thread(wait_for_enter);
+
+        while (!enter_pressed && !stop_signal_called) {
+            rx_stream->recv(temp_buf.data(), samps_per_buff, md, 3.0, false);
+        }
+
+        enter_thread.join();
+
+        if (stop_signal_called) {
+            std::cout << "\nAborted." << std::endl;
+            stream_cmd.stream_mode = uhd::stream_cmd_t::STREAM_MODE_STOP_CONTINUOUS;
+            rx_stream->issue_stream_cmd(stream_cmd);
+            return;
+        }
     }
 
     // Retry logic at start
@@ -655,6 +685,8 @@ int UHD_SAFE_MAIN(int argc, char* argv[])
         // Overflow handling
         ("skip-first", po::value<int>(&skip_first)->default_value(1), "skip first N recv() calls (warm-up)")
         ("start-retries", po::value<int>(&start_retries)->default_value(3), "max retries at start on overflow")
+        // Wait mode
+        ("wait", "wait for Enter key before recording (non-trigger mode only)")
     ;
 
     po::variables_map vm;
@@ -670,6 +702,7 @@ int UHD_SAFE_MAIN(int argc, char* argv[])
     bool null = vm.count("null") > 0;
     bool continue_on_bad_packet = vm.count("continue") > 0;
     bool trig_enabled = vm.count("trig") > 0;
+    bool wait_mode = vm.count("wait") > 0;
     bool auto_filename = !vm.count("file") && !null;
 
     // Validate auto-filename requirements
@@ -778,15 +811,15 @@ int UHD_SAFE_MAIN(int argc, char* argv[])
         if (type == "double")
             recv_to_file_immediate<std::complex<double>>(usrp, "fc64", wirefmt, channel, output_file, spb,
                 total_time, null, continue_on_bad_packet,
-                output_dir, hostname, freq, gain_val, file_desc, skip_first, start_retries);
+                output_dir, hostname, freq, gain_val, file_desc, skip_first, start_retries, wait_mode);
         else if (type == "float")
             recv_to_file_immediate<std::complex<float>>(usrp, "fc32", wirefmt, channel, output_file, spb,
                 total_time, null, continue_on_bad_packet,
-                output_dir, hostname, freq, gain_val, file_desc, skip_first, start_retries);
+                output_dir, hostname, freq, gain_val, file_desc, skip_first, start_retries, wait_mode);
         else if (type == "short")
             recv_to_file_immediate<std::complex<short>>(usrp, "sc16", wirefmt, channel, output_file, spb,
                 total_time, null, continue_on_bad_packet,
-                output_dir, hostname, freq, gain_val, file_desc, skip_first, start_retries);
+                output_dir, hostname, freq, gain_val, file_desc, skip_first, start_retries, wait_mode);
         else
             throw std::runtime_error("Unknown type " + type);
     }
